@@ -1,28 +1,33 @@
-# run main.py
 name: Auto Sign
-
 
 on:
   schedule:
     - cron: '0 0 * * *' # 08:00 Asia/Hong_Kong
   workflow_dispatch:
 
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python 3.9
         uses: actions/setup-python@v4
         with:
           python-version: 3.9
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
           pip install cryptography
-      - name: Run main.py
+
+      - name: Run Arknights sign-in
+        id: arknights
+        continue-on-error: true
         env:
           GitHub_Actions: true
           TOKEN: ${{ secrets.TOKEN }}
@@ -31,11 +36,25 @@ jobs:
           EXIT_WHEN_FAIL: true
         run: |
           set -o pipefail
-          python src/main.py 2>&1 | tee sign_result.log
+          python src/main.py 2>&1 | tee arknights_result.log
+
+      - name: Run Endfield sign-in
+        id: endfield
+        continue-on-error: true
+        env:
+          SKYLAND_TOKEN: ${{ secrets.ENDFIELD_TOKEN }}
+          SKYLAND_NOTIFY: false
+        run: |
+          set -o pipefail
+          curl --fail --silent --show-error --location "https://raw.githubusercontent.com/sjtt2/endfield_auto_sign/4d9336a088621020006e82b5d807dc86b5f5415b/auto_sign.py" --output endfield_auto_sign.py
+          python endfield_auto_sign.py 2>&1 | tee endfield_result.log
+
       - name: Notify WeCom
-        if: success()
+        if: always()
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+          ARKNIGHTS_OUTCOME: ${{ steps.arknights.outcome }}
+          ENDFIELD_OUTCOME: ${{ steps.endfield.outcome }}
         run: |
           python - <<'PY'
           import ast
@@ -43,14 +62,19 @@ jobs:
           from pathlib import Path
           import requests
 
+          def read_log(path):
+              file = Path(path)
+              return file.read_text(encoding="utf-8", errors="replace") if file.exists() else ""
 
-          log = Path("sign_result.log").read_text(encoding="utf-8", errors="replace")
-          details = []
-          keywords = ("签到成功", "重复签到", "已经签到", "已签到", "签到失败")
-          for line in log.splitlines():
-              if " - INFO - " not in line:
+          def dedupe(items):
+              return list(dict.fromkeys(items))
+
+          arknights = []
+          arknights_keywords = ("签到成功", "签到失败", "重复签到", "已经签到", "已签到")
+          for raw in read_log("arknights_result.log").splitlines():
+              if " - INFO - " not in raw:
                   continue
-              message = line.split(" - INFO - ", 1)[1].strip()
+              message = raw.split(" - INFO - ", 1)[1].strip()
               try:
                   parsed = ast.literal_eval(message)
               except (ValueError, SyntaxError):
@@ -58,19 +82,39 @@ jobs:
               candidates = parsed if isinstance(parsed, list) else [message]
               for item in candidates:
                   text = str(item)
-                  if any(keyword in text for keyword in keywords):
-                      details.append(text)
+                  if text.startswith("[明日方舟]") and any(keyword in text for keyword in arknights_keywords):
+                      arknights.append(text)
+          arknights = dedupe(arknights)
+          if not arknights:
+              if os.environ.get("ARKNIGHTS_OUTCOME") == "failure":
+                  arknights.append("执行失败，未获得详细结果")
+              else:
+                  arknights.append("执行完成，但未提取到角色或奖励详情")
 
+          endfield = []
+          endfield_keywords = ("签到", "获得", "失败", "异常", "已签到")
+          for raw in read_log("endfield_result.log").splitlines():
+              text = raw.strip()
+              if (text.startswith("[账号") or text.startswith("[国服]")) and any(keyword in text for keyword in endfield_keywords):
+                  endfield.append(text)
+          endfield = dedupe(endfield)
+          if not endfield:
+              if os.environ.get("ENDFIELD_OUTCOME") == "failure":
+                  endfield.append("执行失败，未获得详细结果")
+              else:
+                  endfield.append("执行完成，但未提取到角色或奖励详情")
 
-          if not details:
-              details.append("签到任务执行成功，但未提取到奖励详情")
-          content = ("森空岛签到通知\n" + "\n".join(details))[:2000]
+          content = ("森空岛每日签到\n\n《明日方舟》\n" + "\n".join(arknights) + "\n\n《明日方舟：终末地》\n" + "\n".join(endfield))[:2000]
           payload = {"msgtype": "text", "text": {"content": content}}
           response = requests.post(os.environ["WECHAT_WEBHOOK"], json=payload, timeout=15)
           response.raise_for_status()
           result = response.json()
           if result.get("errcode") != 0:
               raise SystemExit(f"WeCom notification failed: {result}")
-          print(f"WeCom notification sent: {content}")
+          print("WeCom notification sent")
+          print(content)
           PY
 
+      - name: Mark failed execution
+        if: always() && (steps.arknights.outcome == 'failure' || steps.endfield.outcome == 'failure')
+        run: exit 1
