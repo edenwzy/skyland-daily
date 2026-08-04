@@ -1,0 +1,189 @@
+name: 森空岛签到自检
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 8 * * *"
+      timezone: "Asia/Shanghai"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: skyland-sign-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    name: 检查签到并自动重试
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 检查森空岛签到状态
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_WORKFLOW: auto_sign.yml
+          TARGET_NAME: 森空岛
+          TARGET_REF: master
+          TARGET_INPUTS: '{}'
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, time as dt_time, timedelta, timezone
+
+          API = "https://api.github.com"
+          token = os.environ["GH_TOKEN"]
+          repository = os.environ["REPOSITORY"]
+          workflow = os.environ["TARGET_WORKFLOW"]
+          target_name = os.environ["TARGET_NAME"]
+          target_ref = os.environ.get("TARGET_REF", "master")
+          target_inputs = json.loads(os.environ.get("TARGET_INPUTS", "{}"))
+          webhook = os.environ.get("WECHAT_WEBHOOK", "").strip()
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "daily-sign-watchdog",
+          }
+          hk_tz = timezone(timedelta(hours=8))
+          today = datetime.now(hk_tz).date()
+          day_start = datetime.combine(today, dt_time.min, tzinfo=hk_tz).astimezone(timezone.utc)
+
+          def api(method, path, payload=None):
+              data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+              request = urllib.request.Request(API + path, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      body = response.read()
+                      return json.loads(body.decode("utf-8")) if body else None
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"GitHub API {method} {path} 失败: {error.code} {detail[:500]}") from error
+
+          def notify(status, detail, run_url=""):
+              if not webhook:
+                  raise RuntimeError("缺少 GitHub Secret: WECHAT_WEBHOOK")
+              link = f"\n[查看 GitHub 运行记录]({run_url})" if run_url else ""
+              content = f"### {target_name}签到自检\n**状态：{status}**\n> {detail}{link}"
+              payload = json.dumps(
+                  {"msgtype": "markdown", "markdown": {"content": content}},
+                  ensure_ascii=False,
+              ).encode("utf-8")
+              request = urllib.request.Request(
+                  webhook,
+                  data=payload,
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  result = json.loads(response.read().decode("utf-8"))
+              if result.get("errcode") != 0:
+                  raise RuntimeError(f"企业微信推送失败: {result}")
+              print("企业微信推送成功")
+              print(content)
+
+          def parse_created(run):
+              return datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+
+          def today_runs():
+              encoded = urllib.parse.quote(workflow, safe="")
+              data = api("GET", f"/repos/{repository}/actions/workflows/{encoded}/runs?per_page=30")
+              return [run for run in data.get("workflow_runs", []) if parse_created(run) >= day_start]
+
+          def successful(runs):
+              return next((run for run in runs if run.get("conclusion") == "success"), None)
+
+          def wait_for_active(max_seconds=720):
+              deadline = time.time() + max_seconds
+              runs = today_runs()
+              while time.time() < deadline:
+                  ok = successful(runs)
+                  if ok:
+                      return ok, runs
+                  if not any(run.get("status") != "completed" for run in runs):
+                      return None, runs
+                  time.sleep(10)
+                  runs = today_runs()
+              return successful(runs), runs
+
+          def dispatch_and_wait(attempt):
+              before_ids = {run["id"] for run in today_runs()}
+              encoded = urllib.parse.quote(workflow, safe="")
+              payload = {"ref": target_ref}
+              if target_inputs:
+                  payload["inputs"] = target_inputs
+              api("POST", f"/repos/{repository}/actions/workflows/{encoded}/dispatches", payload)
+              print(f"已触发第 {attempt} 次重试")
+
+              new_run = None
+              discover_deadline = time.time() + 120
+              while time.time() < discover_deadline:
+                  candidates = [run for run in today_runs() if run["id"] not in before_ids]
+                  if candidates:
+                      new_run = candidates[0]
+                      break
+                  time.sleep(5)
+              if not new_run:
+                  return None, "触发后未发现新的工作流运行"
+
+              run_id = new_run["id"]
+              finish_deadline = time.time() + 900
+              while time.time() < finish_deadline:
+                  run = api("GET", f"/repos/{repository}/actions/runs/{run_id}")
+                  if run.get("status") == "completed":
+                      if run.get("conclusion") == "success":
+                          return run, "success"
+                      return run, str(run.get("conclusion") or "unknown")
+                  time.sleep(10)
+              return new_run, "运行超过 15 分钟仍未结束"
+
+          try:
+              runs = today_runs()
+              ok = successful(runs)
+              if ok:
+                  notify("已成功签到", "今日签到工作流已成功完成，无需重试。", ok.get("html_url", ""))
+                  raise SystemExit(0)
+
+              if any(run.get("status") != "completed" for run in runs):
+                  print("签到工作流仍在运行，等待其结束后再判断。")
+                  ok, runs = wait_for_active()
+                  if ok:
+                      notify("已成功签到", "签到工作流等待后成功完成，无需重试。", ok.get("html_url", ""))
+                      raise SystemExit(0)
+
+              last_run = None
+              last_result = "今日未发现签到运行"
+              for attempt in range(1, 4):
+                  last_run, last_result = dispatch_and_wait(attempt)
+                  if last_result == "success":
+                      notify(
+                          "重试后签到成功",
+                          f"原签到未成功，第 {attempt} 次自动重试后已完成。",
+                          last_run.get("html_url", "") if last_run else "",
+                      )
+                      raise SystemExit(0)
+                  print(f"第 {attempt} 次重试未成功: {last_result}")
+
+              notify(
+                  "签到失败",
+                  f"已自动重试 3 次，仍未成功。最后结果：{last_result}",
+                  last_run.get("html_url", "") if last_run else "",
+              )
+              raise SystemExit(1)
+          except SystemExit:
+              raise
+          except Exception as error:
+              try:
+                  notify("自检程序异常", f"{type(error).__name__}: {error}")
+              finally:
+                  raise
+          PY
