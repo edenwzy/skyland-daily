@@ -2,7 +2,7 @@ name: Auto Sign
 
 on:
   schedule:
-    - cron: '0 0 * * *' # 08:00 Asia/Hong_Kong
+    - cron: '7 0 * * *' # 08:07 Asia/Hong_Kong (avoid top-of-hour congestion)
   workflow_dispatch:
 
 permissions:
