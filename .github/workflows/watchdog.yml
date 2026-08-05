@@ -3,8 +3,9 @@ name: 森空岛签到自检
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 8 * * *"
-      timezone: "Asia/Shanghai"
+    # 香港时间 08:15 主检查；08:30、08:45、09:00 为 GitHub 丢失或延迟日程时的兜底。
+    - cron: "15,30,45 0 * * *"
+    - cron: "0 1 * * *"
 
 permissions:
   contents: read
@@ -29,6 +30,9 @@ jobs:
           TARGET_NAME: 森空岛
           TARGET_REF: master
           TARGET_INPUTS: '{}'
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          SELF_WORKFLOW: watchdog.yml
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         run: |
           python - <<'PY'
@@ -47,6 +51,9 @@ jobs:
           target_name = os.environ["TARGET_NAME"]
           target_ref = os.environ.get("TARGET_REF", "master")
           target_inputs = json.loads(os.environ.get("TARGET_INPUTS", "{}"))
+          current_run_id = int(os.environ["CURRENT_RUN_ID"])
+          event_name = os.environ.get("EVENT_NAME", "")
+          self_workflow = os.environ.get("SELF_WORKFLOW", "watchdog.yml")
           webhook = os.environ.get("WECHAT_WEBHOOK", "").strip()
           headers = {
               "Accept": "application/vnd.github+json",
@@ -99,6 +106,31 @@ jobs:
               data = api("GET", f"/repos/{repository}/actions/workflows/{encoded}/runs?per_page=30")
               return [run for run in data.get("workflow_runs", []) if parse_created(run) >= day_start]
 
+          def previous_scheduled_check():
+              if event_name != "schedule":
+                  return None
+              encoded = urllib.parse.quote(self_workflow, safe="")
+              data = api("GET", f"/repos/{repository}/actions/workflows/{encoded}/runs?per_page=30")
+              previous = [
+                  run for run in data.get("workflow_runs", [])
+                  if parse_created(run) >= day_start
+                  and run.get("id") != current_run_id
+                  and run.get("event") == "schedule"
+                  and run.get("status") == "completed"
+              ]
+              return previous[0] if previous else None
+
+          def automated_retry_count(runs):
+              count = 0
+              for run in runs:
+                  actors = {
+                      (run.get("actor") or {}).get("login"),
+                      (run.get("triggering_actor") or {}).get("login"),
+                  }
+                  if run.get("event") == "workflow_dispatch" and "github-actions[bot]" in actors:
+                      count += 1
+              return count
+
           def successful(runs):
               return next((run for run in runs if run.get("conclusion") == "success"), None)
 
@@ -148,6 +180,15 @@ jobs:
 
           try:
               runs = today_runs()
+              previous_check = previous_scheduled_check()
+              retries_used = automated_retry_count(runs)
+              if previous_check and previous_check.get("conclusion") == "success":
+                  print("今日已有成功的定时自检，兜底检查无需重复运行或推送。")
+                  raise SystemExit(0)
+              if previous_check and retries_used >= 3:
+                  print("今日自检已完成最多 3 次自动重试，兜底检查不再重复尝试或推送。")
+                  raise SystemExit(0)
+
               ok = successful(runs)
               if ok:
                   notify("已成功签到", "今日签到工作流已成功完成，无需重试。", ok.get("html_url", ""))
@@ -162,7 +203,11 @@ jobs:
 
               last_run = None
               last_result = "今日未发现签到运行"
-              for attempt in range(1, 4):
+              if retries_used >= 3:
+                  notify("签到失败", "今日已自动重试 3 次，仍未成功。")
+                  raise SystemExit(1)
+
+              for attempt in range(retries_used + 1, 4):
                   last_run, last_result = dispatch_and_wait(attempt)
                   if last_result == "success":
                       notify(
